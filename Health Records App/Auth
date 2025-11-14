@@ -1,0 +1,767 @@
+"""
+Secure Authentication & Authorization System
+Demonstrates: Password Hashing, MFA, RBAC, Session Management, Security Best Practices
+"""
+
+import dash
+from dash import dcc, html, dash_table, no_update, ctx
+from dash.dependencies import Input, Output, State
+import dash_bootstrap_components as dbc
+import sqlite3
+import bcrypt
+import secrets
+import pyotp  # For Time-based One-Time Passwords (TOTP)
+import qrcode  # For generating QR codes for MFA setup
+import io
+import base64
+from datetime import datetime, timedelta
+import hashlib
+import json
+from functools import wraps
+import re
+
+# ============================================================================
+# 1. DATABASE INITIALIZATION & SECURITY FUNCTIONS
+# ============================================================================
+
+def init_security_db():
+    """
+    Initialize database with security-focused schema.
+    Implements best practices for authentication and authorization.
+    """
+    with sqlite3.connect('secure_auth.db') as conn:
+        cursor = conn.cursor()
+        
+        # Users table with enhanced security fields
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('student', 'faculty', 'admin')),
+                mfa_secret TEXT,
+                mfa_enabled BOOLEAN DEFAULT 0,
+                account_locked BOOLEAN DEFAULT 0,
+                failed_login_attempts INTEGER DEFAULT 0,
+                last_failed_login TIMESTAMP,
+                password_changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        """)
+        
+        # Active sessions table for tracking logged-in users
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                session_token TEXT UNIQUE NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                is_active BOOLEAN DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Audit log for security events
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                event_type TEXT NOT NULL,
+                event_description TEXT,
+                ip_address TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
+            )
+        """)
+        
+        # Role permissions table for RBAC
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS role_permissions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                role TEXT NOT NULL,
+                resource TEXT NOT NULL,
+                can_read BOOLEAN DEFAULT 0,
+                can_write BOOLEAN DEFAULT 0,
+                can_delete BOOLEAN DEFAULT 0,
+                UNIQUE(role, resource)
+            )
+        """)
+        
+        # Password reset tokens
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token TEXT UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                used BOOLEAN DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        
+        # Initialize default admin user if not exists
+        cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
+        if cursor.fetchone()[0] == 0:
+            admin_password = 'SecureAdmin123!'
+            password_hash = hash_password(admin_password)
+            cursor.execute("""
+                INSERT INTO users (username, email, password_hash, role, mfa_enabled)
+                VALUES (?, ?, ?, ?, ?)
+            """, ('admin', 'admin@example.com', password_hash, 'admin', 0))
+            
+            log_audit_event(cursor, None, 'admin', 'ACCOUNT_CREATED', 
+                          'Default admin account created', '127.0.0.1')
+        
+        # Initialize default role permissions
+        default_permissions = [
+            # Students can read their own data
+            ('student', 'dashboard', 1, 0, 0),
+            ('student', 'profile', 1, 1, 0),
+            ('student', 'courses', 1, 0, 0),
+            
+            # Faculty can read/write course content
+            ('faculty', 'dashboard', 1, 0, 0),
+            ('faculty', 'profile', 1, 1, 0),
+            ('faculty', 'courses', 1, 1, 0),
+            ('faculty', 'grades', 1, 1, 0),
+            ('faculty', 'students', 1, 0, 0),
+            
+            # Admins have full access
+            ('admin', 'dashboard', 1, 1, 1),
+            ('admin', 'profile', 1, 1, 1),
+            ('admin', 'courses', 1, 1, 1),
+            ('admin', 'grades', 1, 1, 1),
+            ('admin', 'students', 1, 1, 1),
+            ('admin', 'faculty', 1, 1, 1),
+            ('admin', 'users', 1, 1, 1),
+            ('admin', 'security', 1, 1, 1),
+        ]
+        
+        for perm in default_permissions:
+            cursor.execute("""
+                INSERT OR IGNORE INTO role_permissions 
+                (role, resource, can_read, can_write, can_delete)
+                VALUES (?, ?, ?, ?, ?)
+            """, perm)
+        
+        conn.commit()
+
+# ============================================================================
+# 2. PASSWORD SECURITY FUNCTIONS
+# ============================================================================
+
+def hash_password(password: str) -> str:
+    """
+    Hash password using bcrypt with automatic salt generation.
+    Bcrypt is designed to be slow, making brute-force attacks harder.
+    """
+    salt = bcrypt.gensalt(rounds=12)  # 12 rounds is a good balance
+    return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify password against stored hash."""
+    try:
+        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+    except:
+        return False
+
+def validate_password_strength(password: str) -> tuple[bool, str]:
+    """
+    Validate password meets security requirements.
+    Returns (is_valid, error_message)
+    """
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long"
+    if not re.search(r'[A-Z]', password):
+        return False, "Password must contain at least one uppercase letter"
+    if not re.search(r'[a-z]', password):
+        return False, "Password must contain at least one lowercase letter"
+    if not re.search(r'\d', password):
+        return False, "Password must contain at least one number"
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        return False, "Password must contain at least one special character"
+    
+    # Check against common passwords (simplified)
+    common_passwords = ['password', '12345678', 'qwerty', 'admin123']
+    if password.lower() in common_passwords:
+        return False, "Password is too common. Please choose a stronger password"
+    
+    return True, ""
+
+# ============================================================================
+# 3. MULTI-FACTOR AUTHENTICATION (MFA) FUNCTIONS
+# ============================================================================
+
+def generate_mfa_secret() -> str:
+    """Generate a random secret for TOTP (Time-based One-Time Password)."""
+    return pyotp.random_base32()
+
+def generate_qr_code(username: str, mfa_secret: str) -> str:
+    """
+    Generate QR code for MFA setup.
+    Users scan this with Google Authenticator or similar apps.
+    """
+    totp_uri = pyotp.totp.TOTP(mfa_secret).provisioning_uri(
+        name=username,
+        issuer_name='Secure Auth System'
+    )
+    
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(totp_uri)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert to base64 for display in browser
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    buffer.seek(0)
+    img_base64 = base64.b64encode(buffer.getvalue()).decode()
+    
+    return f"data:image/png;base64,{img_base64}"
+
+def verify_mfa_token(mfa_secret: str, token: str) -> bool:
+    """Verify the 6-digit MFA token provided by user."""
+    totp = pyotp.TOTP(mfa_secret)
+    return totp.verify(token, valid_window=1)  # Allow 30 seconds clock skew
+
+# ============================================================================
+# 4. SESSION MANAGEMENT
+# ============================================================================
+
+def create_session(user_id: int, ip_address: str = None, user_agent: str = None) -> str:
+    """
+    Create a new session for authenticated user.
+    Returns session token.
+    """
+    session_token = secrets.token_urlsafe(32)
+    expires_at = datetime.now() + timedelta(hours=24)  # 24-hour session
+    
+    with sqlite3.connect('secure_auth.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO sessions 
+            (user_id, session_token, ip_address, user_agent, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (user_id, session_token, ip_address, user_agent, expires_at))
+        conn.commit()
+    
+    return session_token
+
+def validate_session(session_token: str) -> dict:
+    """
+    Validate session token and return user information.
+    Returns None if session is invalid or expired.
+    """
+    if not session_token:
+        return None
+    
+    with sqlite3.connect('secure_auth.db') as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        result = cursor.execute("""
+            SELECT s.*, u.username, u.email, u.role, u.mfa_enabled
+            FROM sessions s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.session_token = ? 
+            AND s.is_active = 1 
+            AND s.expires_at > CURRENT_TIMESTAMP
+        """, (session_token,)).fetchone()
+        
+        if result:
+            return dict(result)
+        return None
+
+def invalidate_session(session_token: str):
+    """Invalidate/logout a session."""
+    with sqlite3.connect('secure_auth.db') as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE sessions 
+            SET is_active = 0 
+            WHERE session_token = ?
+        """, (session_token,))
+        conn.commit()
+
+# ============================================================================
+# 5. ROLE-BASED ACCESS CONTROL (RBAC)
+# ============================================================================
+
+def check_permission(role: str, resource: str, action: str) -> bool:
+    """
+    Check if a role has permission to perform an action on a resource.
+    Actions: 'read', 'write', 'delete'
+    """
+    with sqlite3.connect('secure_auth.db') as conn:
+        cursor = conn.cursor()
+        
+        column_map = {
+            'read': 'can_read',
+            'write': 'can_write',
+            'delete': 'can_delete'
+        }
+        
+        column = column_map.get(action)
+        if not column:
+            return False
+        
+        result = cursor.execute(f"""
+            SELECT {column} FROM role_permissions
+            WHERE role = ? AND resource = ?
+        """, (role, resource)).fetchone()
+        
+        return result and result[0] == 1
+
+def get_user_permissions(role: str) -> dict:
+    """Get all permissions for a role."""
+    with sqlite3.connect('secure_auth.db') as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        results = cursor.execute("""
+            SELECT resource, can_read, can_write, can_delete
+            FROM role_permissions
+            WHERE role = ?
+        """, (role,)).fetchall()
+        
+        return {row['resource']: dict(row) for row in results}
+
+# ============================================================================
+# 6. AUDIT LOGGING
+# ============================================================================
+
+def log_audit_event(cursor, user_id: int, username: str, event_type: str, 
+                    description: str, ip_address: str = None):
+    """Log security-relevant events for audit trail."""
+    cursor.execute("""
+        INSERT INTO audit_log 
+        (user_id, username, event_type, event_description, ip_address)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, username, event_type, description, ip_address))
+
+def get_audit_logs(limit: int = 100):
+    """Retrieve recent audit logs."""
+    with sqlite3.connect('secure_auth.db') as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        results = cursor.execute("""
+            SELECT * FROM audit_log
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        
+        return [dict(row) for row in results]
+
+# ============================================================================
+# 7. AUTHENTICATION FUNCTIONS
+# ============================================================================
+
+def register_user(username: str, email: str, password: str, role: str) -> tuple[bool, str]:
+    """
+    Register a new user with secure password hashing.
+    Returns (success, message)
+    """
+    # Validate password strength
+    is_valid, error_msg = validate_password_strength(password)
+    if not is_valid:
+        return False, error_msg
+    
+    # Validate email format
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email):
+        return False, "Invalid email format"
+    
+    password_hash = hash_password(password)
+    
+    try:
+        with sqlite3.connect('secure_auth.db') as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (username, email, password_hash, role)
+                VALUES (?, ?, ?, ?)
+            """, (username, email, password_hash, role))
+            
+            log_audit_event(cursor, None, username, 'ACCOUNT_CREATED',
+                          f'New {role} account created', '127.0.0.1')
+            conn.commit()
+            
+        return True, "Account created successfully"
+    except sqlite3.IntegrityError as e:
+        if 'username' in str(e):
+            return False, "Username already exists"
+        elif 'email' in str(e):
+            return False, "Email already registered"
+        return False, "Registration failed"
+
+def authenticate_user(username: str, password: str, mfa_token: str = None) -> tuple[bool, str, dict]:
+    """
+    Authenticate user with password and optional MFA.
+    Returns (success, message, user_data)
+    """
+    with sqlite3.connect('secure_auth.db') as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        # Get user from database
+        user = cursor.execute("""
+            SELECT * FROM users WHERE username = ?
+        """, (username,)).fetchone()
+        
+        if not user:
+            log_audit_event(cursor, None, username, 'LOGIN_FAILED',
+                          'Username not found', '127.0.0.1')
+            return False, "Invalid username or password", None
+        
+        # Check if account is locked
+        if user['account_locked']:
+            log_audit_event(cursor, user['id'], username, 'LOGIN_BLOCKED',
+                          'Account is locked', '127.0.0.1')
+            return False, "Account is locked. Contact administrator.", None
+        
+        # Verify password
+        if not verify_password(password, user['password_hash']):
+            # Increment failed login attempts
+            failed_attempts = user['failed_login_attempts'] + 1
+            cursor.execute("""
+                UPDATE users 
+                SET failed_login_attempts = ?,
+                    last_failed_login = CURRENT_TIMESTAMP,
+                    account_locked = CASE WHEN ? >= 5 THEN 1 ELSE 0 END
+                WHERE id = ?
+            """, (failed_attempts, failed_attempts, user['id']))
+            
+            log_audit_event(cursor, user['id'], username, 'LOGIN_FAILED',
+                          f'Invalid password (attempt {failed_attempts})', '127.0.0.1')
+            conn.commit()
+            
+            if failed_attempts >= 5:
+                return False, "Account locked after 5 failed attempts", None
+            return False, "Invalid username or password", None
+        
+        # Check MFA if enabled
+        if user['mfa_enabled']:
+            if not mfa_token:
+                return False, "MFA_REQUIRED", dict(user)
+            
+            if not verify_mfa_token(user['mfa_secret'], mfa_token):
+                log_audit_event(cursor, user['id'], username, 'MFA_FAILED',
+                              'Invalid MFA token', '127.0.0.1')
+                return False, "Invalid MFA token", None
+        
+        # Authentication successful - reset failed attempts
+        cursor.execute("""
+            UPDATE users 
+            SET failed_login_attempts = 0,
+                last_login = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (user['id'],))
+        
+        log_audit_event(cursor, user['id'], username, 'LOGIN_SUCCESS',
+                      'User logged in successfully', '127.0.0.1')
+        conn.commit()
+        
+        return True, "Login successful", dict(user)
+
+# ============================================================================
+# 8. DASH APP INITIALIZATION
+# ============================================================================
+
+app = dash.Dash(__name__,
+                suppress_callback_exceptions=True,
+                title="Secure Auth System",
+                external_stylesheets=[dbc.themes.BOOTSTRAP])
+
+server = app.server
+
+# ============================================================================
+# 9. LAYOUT DEFINITIONS
+# ============================================================================
+
+def login_layout():
+    """Login page with optional MFA input."""
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader(html.H3("🔐 Secure Login", className="text-center")),
+                    dbc.CardBody([
+                        html.Div(id='login-alert'),
+                        dbc.Input(id='login-username', placeholder='Username', 
+                                 className="mb-3", type="text"),
+                        dbc.Input(id='login-password', placeholder='Password', 
+                                 className="mb-3", type="password"),
+                        html.Div(id='mfa-input-container', style={'display': 'none'}, children=[
+                            dbc.Label("Enter 6-digit MFA code:"),
+                            dbc.Input(id='login-mfa-token', placeholder='000000', 
+                                     className="mb-3", type="text", maxLength=6),
+                        ]),
+                        dbc.Button('Login', id='login-button', color='primary', 
+                                  className="w-100 mb-2"),
+                        html.Hr(),
+                        html.Div([
+                            dcc.Link("Register New Account", href="/register", 
+                                    className="text-center d-block")
+                        ])
+                    ])
+                ], className="shadow")
+            ], width=12, lg=6, className="mx-auto")
+        ], className="mt-5")
+    ])
+
+def register_layout():
+    """Registration page with password strength indicator."""
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader(html.H3("📝 Register Account", className="text-center")),
+                    dbc.CardBody([
+                        html.Div(id='register-alert'),
+                        dbc.Input(id='reg-username', placeholder='Username', 
+                                 className="mb-3", type="text"),
+                        dbc.Input(id='reg-email', placeholder='Email', 
+                                 className="mb-3", type="email"),
+                        dbc.Input(id='reg-password', placeholder='Password', 
+                                 className="mb-2", type="password"),
+                        html.Div(id='password-strength', className="mb-3"),
+                        dbc.Select(id='reg-role', 
+                                  options=[
+                                      {'label': 'Student', 'value': 'student'},
+                                      {'label': 'Faculty', 'value': 'faculty'},
+                                      {'label': 'Admin', 'value': 'admin'}
+                                  ],
+                                  value='student',
+                                  className="mb-3"),
+                        html.Small("Password must be 8+ characters with uppercase, lowercase, number, and special character", 
+                                  className="text-muted d-block mb-3"),
+                        dbc.Button('Register', id='register-button', color='success', 
+                                  className="w-100 mb-2"),
+                        html.Hr(),
+                        dcc.Link("Back to Login", href="/login", 
+                                className="text-center d-block")
+                    ])
+                ], className="shadow")
+            ], width=12, lg=6, className="mx-auto")
+        ], className="mt-5")
+    ])
+
+def student_dashboard_layout(user_data):
+    """Student role dashboard."""
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                html.H2(f"👨‍🎓 Student Dashboard - Welcome {user_data['username']}!"),
+                html.Hr(),
+            ])
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("📚 My Courses"),
+                    dbc.CardBody([
+                        html.Ul([
+                            html.Li("Introduction to Computer Science"),
+                            html.Li("Data Structures and Algorithms"),
+                            html.Li("Web Development"),
+                        ])
+                    ])
+                ], className="mb-3")
+            ], width=12, md=6),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("📊 My Grades"),
+                    dbc.CardBody([
+                        dash_table.DataTable(
+                            data=[
+                                {'course': 'CS101', 'grade': 'A', 'credits': 3},
+                                {'course': 'CS201', 'grade': 'B+', 'credits': 4},
+                                {'course': 'CS301', 'grade': 'A-', 'credits': 3},
+                            ],
+                            columns=[
+                                {'name': 'Course', 'id': 'course'},
+                                {'name': 'Grade', 'id': 'grade'},
+                                {'name': 'Credits', 'id': 'credits'}
+                            ]
+                        )
+                    ])
+                ], className="mb-3")
+            ], width=12, md=6)
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("ℹ️ Access Information"),
+                    dbc.CardBody([
+                        html.P(f"Role: {user_data['role'].title()}"),
+                        html.P(f"Email: {user_data['email']}"),
+                        html.P(f"MFA Status: {'Enabled ✅' if user_data.get('mfa_enabled') else 'Disabled ⚠️'}"),
+                        html.Small("Students can view courses and grades but cannot modify them.", 
+                                  className="text-muted")
+                    ])
+                ])
+            ])
+        ])
+    ], className="mt-4")
+
+def faculty_dashboard_layout(user_data):
+    """Faculty role dashboard."""
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                html.H2(f"👨‍🏫 Faculty Dashboard - Welcome {user_data['username']}!"),
+                html.Hr(),
+            ])
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("📚 My Courses"),
+                    dbc.CardBody([
+                        html.Ul([
+                            html.Li("CS101 - Introduction to CS (Section A)"),
+                            html.Li("CS301 - Advanced Algorithms (Section B)"),
+                        ])
+                    ])
+                ], className="mb-3")
+            ], width=12, md=6),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("👥 My Students"),
+                    dbc.CardBody([
+                        html.P("Total Students: 45"),
+                        html.P("CS101: 30 students"),
+                        html.P("CS301: 15 students"),
+                    ])
+                ], className="mb-3")
+            ], width=12, md=6)
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("🔧 Faculty Actions"),
+                    dbc.CardBody([
+                        dbc.Button("Grade Submissions", color="primary", className="me-2 mb-2"),
+                        dbc.Button("Update Course Content", color="info", className="me-2 mb-2"),
+                        dbc.Button("View Student Profiles", color="secondary", className="mb-2"),
+                    ])
+                ], className="mb-3")
+            ])
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("ℹ️ Access Information"),
+                    dbc.CardBody([
+                        html.P(f"Role: {user_data['role'].title()}"),
+                        html.P(f"Email: {user_data['email']}"),
+                        html.P(f"MFA Status: {'Enabled ✅' if user_data.get('mfa_enabled') else 'Disabled ⚠️'}"),
+                        html.Small("Faculty can read/write course content and grades.", 
+                                  className="text-muted")
+                    ])
+                ])
+            ])
+        ])
+    ], className="mt-4")
+
+def admin_dashboard_layout(user_data):
+    """Admin role dashboard with full access."""
+    audit_logs = get_audit_logs(10)
+    
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                html.H2(f"⚙️ Admin Dashboard - Welcome {user_data['username']}!"),
+                html.Hr(),
+            ])
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("👥 User Management"),
+                    dbc.CardBody([
+                        html.Div(id='user-management-content'),
+                        dbc.Button("Refresh Users", id='refresh-users-btn', 
+                                  color="primary", className="mt-2")
+                    ])
+                ], className="mb-3")
+            ], width=12, md=6),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("🔐 Security Audit Log"),
+                    dbc.CardBody([
+                        dash_table.DataTable(
+                            id='audit-log-table',
+                            data=audit_logs,
+                            columns=[
+                                {'name': 'Time', 'id': 'timestamp'},
+                                {'name': 'User', 'id': 'username'},
+                                {'name': 'Event', 'id': 'event_type'},
+                                {'name': 'Description', 'id': 'event_description'}
+                            ],
+                            page_size=10,
+                            style_cell={'textAlign': 'left', 'fontSize': '12px'},
+                            style_header={'fontWeight': 'bold'}
+                        )
+                    ])
+                ], className="mb-3")
+            ], width=12, md=6)
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("🛡️ System Permissions (RBAC)"),
+                    dbc.CardBody([
+                        html.Div(id='permissions-view')
+                    ])
+                ], className="mb-3")
+            ])
+        ]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("ℹ️ Access Information"),
+                    dbc.CardBody([
+                        html.P(f"Role: {user_data['role'].title()}"),
+                        html.P(f"Email: {user_data['email']}"),
+                        html.P(f"MFA Status: {'Enabled ✅' if user_data.get('mfa_enabled') else 'Disabled ⚠️'}"),
+                        html.Small("Admins have full system access and can manage users and security.", 
+                                  className="text-muted")
+                    ])
+                ])
+            ])
+        ])
+    ], className="mt-4")
+
+def mfa_setup_layout(user_data):
+    """MFA setup page with QR code."""
+    mfa_secret = generate_mfa_secret()
+    qr_code_image = generate_qr_code(user_data['username'], mfa_secret)
+    
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader(html.H3("🔐 Set Up Multi-Factor Authentication", 
+                                          className="text-center")),
+                    dbc.CardBody([
+                        html.Div(id='mfa-setup-alert'),
+                        html.H5("Step 1: Install an Authenticator App"),
+                        html.P("Download Google Authenticator, Authy, or similar app on your phone."),
+                        html.Hr(),
+                        html.H5("Step 2: Scan this QR Code"),
+                        html.Img(src=qr_code_image, style={'width': '250px', 'height': '250px'}),
+                        html.P("Or enter this code manually:", className="mt-3"),
+                        dbc.Input(value=mfa_secret, readonly=True, className="mb-3"),
+                        html.Hr(),
+                        html.H5("Step 3: Verify Setup"),
+                        dbc.Input(id='
+                                  

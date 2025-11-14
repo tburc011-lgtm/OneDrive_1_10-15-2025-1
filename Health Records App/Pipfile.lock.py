@@ -77,6 +77,7 @@ def init_db():
 # --- Database Helper Functions ---
 # Each function below performs a specific CRUD (Create, Read, Update, Delete) operation.
 
+
 def create_class(class_name):
     """Adds a new class to the 'classes' table."""
     with sqlite3.connect('medical_records.db') as conn:

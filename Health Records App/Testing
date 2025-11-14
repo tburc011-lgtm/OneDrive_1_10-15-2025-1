@@ -117,11 +117,11 @@ def logout():
 
 if __name__ == '__main__':
     app.run(debug=True)
-<h2>Login</h2>
-<form method="POST">
-  <input name="username" placeholder="Username" required><br>
-  <input name="password" type="password" placeholder="Password" required><br>
-  <button type="submit">Login</button>
+h2>Login</h2>
+form method="POST">
+input name="username" placeholder="Username" required><br>
+input name="password" type="password" placeholder="Password" required><br>
+button type="submit">Login</button>
 </form>
 <h2>Multi-Factor Authentication</h2>
 <p>Scan this QR code in Google Authenticator:</p>
